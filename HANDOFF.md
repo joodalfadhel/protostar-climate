@@ -1,6 +1,6 @@
 # Handoff
 
-**Code pushed and runnable by Sunday night.** We submit Tuesday by 12pm (official deadline Tue Nov 10, 11:59 PM ET). Read the Space's *About* and *Data & submission* tabs once.
+Read the Space's *About* and *Data & submission* tabs once.
 
 ## The task
 - Stand at the end of 2018. Forecast 2019–2025 for 210 cities × 4 metrics = 5,880 rows in `submission.csv` (the rows are pre-filled; we fill `predicted_value`).
