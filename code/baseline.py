@@ -41,14 +41,67 @@ METRICS = {
 # pooled variants: name -> (baseline window in years, weight on the city's own slope)
 POOLED = {"pooled": (30, 0.0), "pooled25": (30, 0.25), "pooled50": (30, 0.5),
           "pooled20": (20, 0.0), "pooled15": (15, 0.0), "pooled10": (10, 0.0)}
+# ensembles: name -> component methods, averaged with equal weight
+_ENS_WARM = {"ensP": ("pooled", "pooled20", "pooled15", "pooled10"),
+             "ensPT": ("pooled", "pooled10", "trend30", "avg10")}
+_ENS_FLAT = {"ensA": ("avg30", "med30", "avg15", "avg10"),
+             "ensB": ("avg20", "avg10", "med15")}
+ENSEMBLES = {"annual_avg_temp": _ENS_WARM, "cdd": _ENS_WARM,
+             "total_precip_in": _ENS_FLAT, "hottest_day_temp": _ENS_FLAT}
 # methods tried per metric
 _BASIC = ("last", "avg30", "trend30")
 METHODS = {
-    "annual_avg_temp": _BASIC + tuple(POOLED),
-    "cdd": _BASIC + tuple(POOLED),
-    "total_precip_in": _BASIC + ("med30", "avg20", "avg15", "avg10", "med15"),
-    "hottest_day_temp": _BASIC + ("med30", "avg20", "avg15", "avg10", "med15"),
+    "annual_avg_temp": _BASIC + tuple(POOLED) + tuple(_ENS_WARM),
+    "cdd": _BASIC + tuple(POOLED) + tuple(_ENS_WARM),
+    "total_precip_in": _BASIC + ("med30", "avg20", "avg15", "avg10", "med15") + tuple(_ENS_FLAT),
+    "hottest_day_temp": _BASIC + ("med30", "avg20", "avg15", "avg10", "med15") + tuple(_ENS_FLAT),
 }
+COL_TO_CODE = {v: k for k, v in METRICS.items()}
+# geography-shrunk trend: name -> (fit window in years, shrinkage k toward the geography slope)
+GEO_METHODS = {"geo30": (30, 0.5), "geo40": (40, 0.5), "geo50": (50, 0.5), "geo30k8": (30, 0.8)}
+for _m in METHODS:
+    METHODS[_m] = METHODS[_m] + tuple(GEO_METHODS)
+GEO_FEATURES = ROOT / "data" / "city_features.csv"
+
+
+def geo_matrix():
+    g = pd.read_csv(GEO_FEATURES).set_index("ID")
+    return pd.DataFrame({
+        "elev": g["elevation_m"] / 1000,
+        "w_coast": g["w_coast"], "w_gulf": g["w_gulf_stream"], "w_calif": g["w_calif_current"],
+        "lat": (g["Lat"] - g["Lat"].mean()) / g["Lat"].std(),
+        "lon": (g["Lon"] - g["Lon"].mean()) / g["Lon"].std(),
+    })
+
+
+def predict_geo(df, last_year, years, col, window, k, lam=1.0):
+    """Each city's trend, shrunk toward the slope predicted from its geography
+    (ridge regression across cities on elevation, coast and ocean-current features)."""
+    G = geo_matrix()
+    fits = {}
+    for city, g in df[(df["Year"] <= last_year) & (df["Year"] > last_year - window)].groupby("ID"):
+        g = g[["Year", col]].dropna()
+        if len(g) >= 10 and city in G.index:
+            slope = np.polyfit(g["Year"], g[col], 1)[0]
+            fits[city] = (slope, g[col].mean(), g["Year"].mean())
+    s = pd.DataFrame(fits, index=["slope", "mean", "xm"]).T
+    X = np.c_[np.ones(len(s)), G.loc[s.index].values]
+    beta = np.linalg.solve(X.T @ X + lam * np.eye(X.shape[1]), X.T @ s["slope"].values)
+    s["geo_slope"] = X @ beta
+    yrs = np.asarray(years)
+    out = []
+    for city in df[df["Year"] <= last_year]["ID"].unique():
+        if city in s.index:
+            r = s.loc[city]
+            sl = (1 - k) * r["slope"] + k * r["geo_slope"]
+            p = r["mean"] + sl * (yrs - r["xm"])
+            if col in ("cdd", "ToT Prcp"):
+                p = np.maximum(p, 0)
+        else:  # too little history: fall back to the 30-year average
+            h = df[(df["ID"] == city) & (df["Year"] <= last_year)].set_index("Year")[col]
+            p = forecast(h, last_year, years, "avg30").values
+        out.append(pd.DataFrame({"ID": city, "Year": years, "pred": p}))
+    return pd.concat(out, ignore_index=True)
 WINDOW = 30
 TREND_WINDOW = 40  # years used to fit the pooled warming line
 HORIZON = 7
@@ -56,12 +109,23 @@ ORIGINS = (1996, 2000, 2004, 2008, 2011)  # backtest cutoffs; each predicts the 
 MAX_MISSING_DAYS = 10
 
 
+CURATED = ROOT / "data" / "annual_valid.csv"
+
+
 def load_annual():
-    df = load_dataset(REPO, "annual_indices", split="train").to_pandas()
+    """Read the curated table in data/; build it from the challenge dataset if missing."""
+    if CURATED.exists():
+        df = pd.read_csv(CURATED)
+    else:
+        df = load_dataset(REPO, "annual_indices", split="train").to_pandas()
+        df = df.replace([np.inf, -np.inf], np.nan)  # Max Tmax is -inf in empty years
+        miss_cols = [c for c in df.columns if c.startswith("Miss")]
+        if miss_cols:  # drop badly incomplete years, as the scorer does
+            df = df[df[miss_cols].max(axis=1) <= MAX_MISSING_DAYS]
+        CURATED.parent.mkdir(exist_ok=True)
+        df.to_csv(CURATED, index=False)
+        print(f"Saved curated data to {CURATED}")
     assert df["Year"].max() <= 2018, "Weather input dated after 2018: data rule"
-    miss_cols = [c for c in df.columns if c.startswith("Miss")]
-    if miss_cols:  # drop badly incomplete years, as the scorer does
-        df = df[df[miss_cols].max(axis=1) <= MAX_MISSING_DAYS]
     return df
 
 
@@ -125,6 +189,13 @@ def forecast(series: pd.Series, last_year: int, years, method: str,
 
 
 def predict_all(df, last_year, years, method, col):
+    ens = ENSEMBLES[COL_TO_CODE[col]].get(method)
+    if ens:  # equal-weight average of the component forecasts
+        parts = [predict_all(df, last_year, years, m, col).set_index(["ID", "Year"])["pred"]
+                 for m in ens]
+        return pd.concat(parts, axis=1).mean(axis=1).rename("pred").reset_index()
+    if method in GEO_METHODS:
+        return predict_geo(df, last_year, years, col, *GEO_METHODS[method])
     pooled = method in POOLED
     if pooled:
         window, w = POOLED[method]

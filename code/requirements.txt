@@ -1,0 +1,4 @@
+datasets>=2.19
+pandas>=2.0
+numpy>=1.26
+pillow  # only for code/add_tree_canopy.py
