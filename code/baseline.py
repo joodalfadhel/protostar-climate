@@ -25,7 +25,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from datasets import load_dataset
 
 REPO = "CMU-OSPO/protostar-climate-train-to-2018"
 ROOT = Path(__file__).resolve().parent.parent
@@ -56,6 +55,12 @@ METHODS = {
     "total_precip_in": _BASIC + ("med30", "avg20", "avg15", "avg10", "med15") + tuple(_ENS_FLAT),
     "hottest_day_temp": _BASIC + ("med30", "avg20", "avg15", "avg10", "med15") + tuple(_ENS_FLAT),
 }
+# departure persistence: name -> (base method, strength). The base forecast plus a faded copy of the city's
+# latest departure from the national warming line (see persistence_adjust).
+PERSIST = {"pooled15p": ("pooled15", 1.0), "pooled15h": ("pooled15", 0.5),
+           "ensPp": ("ensP", 1.0), "ensPh": ("ensP", 0.5)}
+for _m in ("annual_avg_temp", "cdd"):
+    METHODS[_m] = METHODS[_m] + tuple(PERSIST)
 COL_TO_CODE = {v: k for k, v in METRICS.items()}
 # geography-shrunk trend: name -> (fit window in years, shrinkage k toward the geography slope)
 GEO_METHODS = {"geo30": (30, 0.5), "geo40": (40, 0.5), "geo50": (50, 0.5), "geo30k8": (30, 0.8)}
@@ -117,6 +122,7 @@ def load_annual():
     if CURATED.exists():
         df = pd.read_csv(CURATED)
     else:
+        from datasets import load_dataset  # only needed when the curated table is missing
         df = load_dataset(REPO, "annual_indices", split="train").to_pandas()
         df = df.replace([np.inf, -np.inf], np.nan)  # Max Tmax is -inf in empty years
         miss_cols = [c for c in df.columns if c.startswith("Miss")]
@@ -188,7 +194,65 @@ def forecast(series: pd.Series, last_year: int, years, method: str,
     raise ValueError(method)
 
 
+def _dist_300km(ids):
+    """0/1 matrix: which cities lie within 300 km of each other (self included)."""
+    g = pd.read_csv(GEO_FEATURES).set_index("ID")
+    W = np.eye(len(ids))
+    known = [i for i, c in enumerate(ids) if c in g.index]
+    lat = np.radians(g.loc[[ids[i] for i in known], "Lat"].values)
+    lon = np.radians(g.loc[[ids[i] for i in known], "Lon"].values)
+    a = np.sin((lat[:, None] - lat[None]) / 2) ** 2 + np.cos(lat)[:, None] * np.cos(lat)[None] * np.sin((lon[:, None] - lon[None]) / 2) ** 2
+    near = (2 * 6371.0 * np.arcsin(np.sqrt(a)) < 300).astype(float)
+    W[np.ix_(known, known)] = near
+    return W
+
+
+def persistence_adjust(df, last_year, years, col, gamma):
+    """Faded carry-over of each city's latest temperature departure (deg F, or CDD via sensitivity).
+
+    Departure = observed temperature minus (city mean + national warming line), split into a regional part
+    (mean of cities within 300 km) and a local remainder. Each part decays by its own year-to-year persistence,
+    estimated across all cities from data up to `last_year`. Idea from a public submission's README
+    (two-scale decay of the recent temperature departure); implemented and backtested here from scratch.
+    """
+    d = df[(df["Year"] <= last_year) & (df["Year"] > last_year - TREND_WINDOW)]
+    temp = d.pivot_table(index="Year", columns="ID", values="Avg Temp")
+    anom = temp - temp.mean()
+    nat = anom.mean(axis=1).dropna()
+    slope, icpt = np.polyfit(nat.index.values, nat.values, 1)
+    E = (anom.sub(icpt + slope * temp.index.values, axis=0)).values
+    ok = ~np.isnan(E)
+    W = _dist_300km(list(temp.columns))
+    reg = (np.nan_to_num(E) @ W.T) / np.maximum(ok.astype(float) @ W.T, 1)
+    loc = E - reg
+
+    def phi(Z):
+        z0, z1 = np.nan_to_num(Z[:-1]), np.nan_to_num(Z[1:])
+        return float(np.clip((z0 * z1).sum() / max((z0 ** 2).sum(), 1e-9), 0, 0.9))
+
+    p_reg, p_loc = phi(reg), phi(loc)
+    last = temp.index[-1] == last_year
+    r_reg = reg[-1] if last else np.zeros(E.shape[1])
+    r_loc = np.nan_to_num(loc[-1]) if last else np.zeros(E.shape[1])
+    sens = cdd_sensitivity(df, last_year) if col == "cdd" else None
+    rows = []
+    for j, city in enumerate(temp.columns):
+        k = 1.0 if sens is None else sens.get(city, sens.median())
+        for y in years:
+            h = y - last_year
+            rows.append((city, y, gamma * k * (r_reg[j] * p_reg ** h + r_loc[j] * p_loc ** h)))
+    return pd.DataFrame(rows, columns=["ID", "Year", "adj"])
+
+
 def predict_all(df, last_year, years, method, col):
+    if method in PERSIST:  # base forecast + faded departure
+        base, gamma = PERSIST[method]
+        p = predict_all(df, last_year, years, base, col).merge(
+            persistence_adjust(df, last_year, years, col, gamma), on=["ID", "Year"], how="left")
+        p["pred"] = p["pred"] + p["adj"].fillna(0.0)
+        if col == "cdd":
+            p["pred"] = p["pred"].clip(lower=0)
+        return p[["ID", "Year", "pred"]]
     ens = ENSEMBLES[COL_TO_CODE[col]].get(method)
     if ens:  # equal-weight average of the component forecasts
         parts = [predict_all(df, last_year, years, m, col).set_index(["ID", "Year"])["pred"]
