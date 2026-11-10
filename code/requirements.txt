@@ -2,3 +2,5 @@ datasets>=2.19
 pandas>=2.0
 numpy>=1.26
 pillow  # only for code/add_tree_canopy.py
+huggingface_hub  # code/check_submission.py reads the city list from the Hub
+fsspec  # same: needed for the hf:// path in check_submission.py
